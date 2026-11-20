@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>事件时间聚合服务</title>
+<style>
+  :root { --bd:#d8dce3; --bg:#f6f7f9; --ink:#1c2330; --mut:#68738a; --acc:#2f6fed; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif; background:var(--bg); color:var(--ink); }
+  header { background:#101828; color:#fff; padding:12px 20px; display:flex; gap:24px; align-items:baseline; flex-wrap:wrap; }
+  header h1 { font-size:16px; margin:0; }
+  header .stat { font-size:13px; color:#b8c2d8; }
+  header .stat b { color:#fff; font-family:ui-monospace,monospace; }
+  main { padding:16px 20px; display:grid; gap:16px; }
+  section { background:#fff; border:1px solid var(--bd); border-radius:8px; padding:14px 16px; }
+  h2 { font-size:14px; margin:0 0 10px; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th,td { text-align:left; padding:5px 8px; border-bottom:1px solid #edf0f4; white-space:nowrap; }
+  th { color:var(--mut); font-weight:600; font-size:12px; }
+  tr.clickable { cursor:pointer; } tr.clickable:hover { background:#f2f6ff; }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; font-weight:600; }
+  .OPEN { background:#e3f5e9; color:#157347; }
+  .CLOSED { background:#e8ebf0; color:#4a5568; }
+  .REOPENED { background:#fff3d6; color:#9a6b00; }
+  .pending { background:#fde2e2; color:#b42318; }
+  .applied { background:#e3f5e9; color:#157347; }
+  .discarded { background:#e8ebf0; color:#4a5568; }
+  .diff-pos { color:#157347; } .diff-neg { color:#b42318; }
+  .stale { color:#b42318; font-weight:600; }
+  button { font:inherit; padding:3px 10px; border:1px solid var(--bd); border-radius:6px; background:#fff; cursor:pointer; }
+  button:hover { border-color:var(--acc); color:var(--acc); }
+  button.primary { background:var(--acc); color:#fff; border-color:var(--acc); }
+  input,select { font:inherit; padding:3px 6px; border:1px solid var(--bd); border-radius:6px; }
+  form { display:flex; gap:8px; flex-wrap:wrap; align-items:end; }
+  label { display:flex; flex-direction:column; font-size:11px; color:var(--mut); gap:2px; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  @media (max-width:1100px){ .grid2 { grid-template-columns:1fr; } }
+  #toast { position:fixed; bottom:16px; right:16px; background:#101828; color:#fff; padding:8px 14px; border-radius:8px; opacity:0; transition:opacity .2s; font-size:13px; max-width:50vw; }
+  .reason { font-size:11px; color:var(--mut); }
+  .empty { color:var(--mut); font-size:13px; padding:6px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>事件时间聚合</h1>
+  <span class="stat">水位 <b id="h-wm">—</b></span>
+  <span class="stat">最大事件时间 <b id="h-max">—</b></span>
+  <span class="stat">窗口 <b id="h-nw">0</b></span>
+  <span class="stat">待处理修订 <b id="h-nr">0</b></span>
+  <span class="stat" id="h-restored"></span>
+</header>
+<main>
+  <div class="grid2">
+    <section>
+      <h2>策略配置（水位 / 允许迟到 / 重算边界）</h2>
+      <form id="cfg-form">
+        <label>窗口大小 (ms)<input name="windowSizeMs" type="number" min="1"></label>
+        <label>允许迟到 (ms)<input name="allowedLatenessMs" type="number" min="0"></label>
+        <label>水位策略
+          <select name="strategy">
+            <option value="bounded-out-of-orderness">bounded-out-of-orderness</option>
+            <option value="punctuated">punctuated</option>
+          </select>
+        </label>
+        <label>最大乱序 (ms)<input name="maxOutOfOrdernessMs" type="number" min="0"></label>
+        <label>重算边界
+          <select name="recomputeBoundary">
+            <option value="window">window（仅本窗口）</option>
+            <option value="key">key（级联同 key 后续窗口）</option>
+          </select>
+        </label>
+        <label>时区
+          <select name="timezone">
+            <option>UTC</option><option>Asia/Shanghai</option><option>America/New_York</option>
+            <option>Europe/Berlin</option><option>Asia/Tokyo</option>
+          </select>
+        </label>
+        <button class="primary" type="submit">更新配置</button>
+      </form>
+    </section>
+    <section>
+      <h2>写入事件</h2>
+      <form id="ev-form">
+        <label>key<input name="key" value="sensor-1" required></label>
+        <label>eventId<input name="eventId" placeholder="留空自动生成"></label>
+        <label>事件时间<input name="eventTime" type="datetime-local" step="1"></label>
+        <label>值<input name="value" type="number" value="1" step="any" required></label>
+        <button class="primary" type="submit">发送 add</button>
+      </form>
+      <form id="rt-form" style="margin-top:8px">
+        <label>撤回目标 eventId<input name="retractOf" required></label>
+        <button type="submit">发送 retract</button>
+      </form>
+      <form id="wm-form" style="margin-top:8px">
+        <label>水位时间戳 (ms, punctuated)<input name="value" type="number"></label>
+        <button type="submit">推进水位</button>
+      </form>
+    </section>
+  </div>
+
+  <section>
+    <h2>窗口状态</h2>
+    <table>
+      <thead><tr><th>key</th><th>窗口开始</th><th>窗口结束</th><th>状态</th><th>当前值</th><th>计数</th><th>累计</th><th>版本数</th><th></th></tr></thead>
+      <tbody id="windows"></tbody>
+    </table>
+    <div class="empty" id="windows-empty">暂无窗口</div>
+  </section>
+
+  <section id="detail-sec" style="display:none">
+    <h2>窗口详情 <span class="mono" id="d-id"></span></h2>
+    <p class="reason" id="d-meta"></p>
+    <h2 style="margin-top:10px">版本历史（当前值 vs 历史值）</h2>
+    <table>
+      <thead><tr><th>版本</th><th>值</th><th>较上一版</th><th>与当前差异</th><th>重算原因</th><th>时间</th></tr></thead>
+      <tbody id="d-versions"></tbody>
+    </table>
+    <h2 style="margin-top:10px">窗口内事件</h2>
+    <table>
+      <thead><tr><th>eventId</th><th>事件时间</th><th>值</th><th>状态</th></tr></thead>
+      <tbody id="d-events"></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>修订队列（窗口关闭后到达的极晚事件 / 撤回 — 不会静默丢弃）</h2>
+    <table>
+      <thead><tr><th>#</th><th>类型</th><th>事件</th><th>入队原因</th><th>状态</th><th>操作</th></tr></thead>
+      <tbody id="revisions"></tbody>
+    </table>
+    <div class="empty" id="revisions-empty">修订队列为空</div>
+  </section>
+</main>
+<div id="toast"></div>
+<script>
+const $ = (s) => document.querySelector(s);
+const fmt = (ms, tz) => ms == null ? '—' :
+  new Date(ms).toLocaleString('sv-SE', { timeZone: tz || 'UTC', hour12: false }).replace('T', ' ') + ' ' + (tz || 'UTC');
+let cfgTz = 'UTC';
+
+function toast(msg) {
+  const t = $('#toast'); t.textContent = msg; t.style.opacity = 1;
+  setTimeout(() => t.style.opacity = 0, 2500);
+}
+async function api(path, method, body) {
+  const r = await fetch(path, { method, headers: { 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || j.reason || r.status);
+  return j;
+}
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+async function refresh() {
+  const s = await api('/api/state', 'GET');
+  cfgTz = s.config.timezone;
+  $('#h-wm').textContent = fmt(s.watermark, cfgTz);
+  $('#h-max').textContent = fmt(s.maxEventTime, cfgTz);
+  $('#h-nw').textContent = s.windows.length;
+  $('#h-nr').textContent = s.revisions.filter(r => r.status === 'pending').length;
+  $('#h-restored').textContent = s.restoredFromCheckpoint ? '已从检查点恢复' : '';
+
+  const f = $('#cfg-form');
+  f.windowSizeMs.value = s.config.windowSizeMs;
+  f.allowedLatenessMs.value = s.config.allowedLatenessMs;
+  f.strategy.value = s.config.watermark.strategy;
+  f.maxOutOfOrdernessMs.value = s.config.watermark.maxOutOfOrdernessMs;
+  f.recomputeBoundary.value = s.config.recomputeBoundary;
+  f.timezone.value = s.config.timezone;
+
+  $('#windows-empty').style.display = s.windows.length ? 'none' : 'block';
+  $('#windows').innerHTML = s.windows.map(w => `
+    <tr class="clickable" data-id="${esc(w.id)}">
+      <td>${esc(w.key)}</td>
+      <td class="mono">${fmt(w.start, w.timezone)}</td>
+      <td class="mono">${fmt(w.end, w.timezone)}</td>
+      <td><span class="badge ${w.state}">${w.state}</span></td>
+      <td class="mono"><b>${w.value}</b></td>
+      <td class="mono">${w.count}</td>
+      <td class="mono">${w.runningTotal}${w.stale ? ' <span class="stale" title="重算边界=window，累计值未级联更新">(过期)</span>' : ''}</td>
+      <td class="mono">${w.versionCount}</td>
+      <td>${w.state === 'CLOSED' ? `<button data-reopen="${esc(w.id)}">重开</button>` : ''}</td>
+    </tr>`).join('');
+  document.querySelectorAll('#windows tr').forEach(tr =>
+    tr.addEventListener('click', (e) => { if (!e.target.dataset.reopen) showDetail(tr.dataset.id); }));
+  document.querySelectorAll('[data-reopen]').forEach(b =>
+    b.addEventListener('click', async () => {
+      const r = await api(`/api/windows/${encodeURIComponent(b.dataset.reopen)}/reopen`, 'POST', {});
+      toast(JSON.stringify(r)); refresh();
+    }));
+
+  $('#revisions-empty').style.display = s.revisions.length ? 'none' : 'block';
+  $('#revisions').innerHTML = s.revisions.map(r => `
+    <tr>
+      <td class="mono">${r.id}</td>
+      <td>${r.event.type}</td>
+      <td class="mono">${esc(JSON.stringify(r.event))}</td>
+      <td class="reason">${esc(r.reason)}</td>
+      <td><span class="badge ${r.status}">${r.status}</span></td>
+      <td>${r.status === 'pending'
+        ? `<button data-apply="${r.id}">应用(重开窗口)</button> <button data-discard="${r.id}">丢弃</button>` : ''}</td>
+    </tr>`).join('');
+  document.querySelectorAll('[data-apply]').forEach(b => b.addEventListener('click', async () => {
+    const r = await api(`/api/revisions/${b.dataset.apply}/apply`, 'POST', {});
+    toast(JSON.stringify(r)); refresh();
+  }));
+  document.querySelectorAll('[data-discard]').forEach(b => b.addEventListener('click', async () => {
+    await api(`/api/revisions/${b.dataset.discard}/discard`, 'POST', {}); refresh();
+  }));
+}
+
+async function showDetail(id) {
+  const d = await api(`/api/windows/${encodeURIComponent(id)}`, 'GET');
+  $('#detail-sec').style.display = 'block';
+  $('#d-id').textContent = d.id;
+  $('#d-meta').textContent = `状态 ${d.state} · 时区 ${d.timezone} · 当前值 ${d.value} · 累计 ${d.runningTotal}${d.stale ? '（过期）' : ''}`;
+  const cur = d.value;
+  $('#d-versions').innerHTML = d.versions.map(v => {
+    const vsCur = cur - v.value;
+    return `<tr>
+      <td class="mono">v${v.v}</td>
+      <td class="mono">${v.value}</td>
+      <td class="mono ${v.diff > 0 ? 'diff-pos' : v.diff < 0 ? 'diff-neg' : ''}">${v.diff > 0 ? '+' : ''}${v.diff}</td>
+      <td class="mono">${v.value === cur ? '—（当前）' : (vsCur > 0 ? '+' : '') + vsCur}</td>
+      <td class="reason">${esc(v.reason)}</td>
+      <td class="mono">${fmt(v.at, cfgTz)}</td>
+    </tr>`;
+  }).join('');
+  $('#d-events').innerHTML = d.events.map(e => `
+    <tr><td class="mono">${esc(e.eventId)}</td><td class="mono">${fmt(e.eventTime, d.timezone)}</td>
+    <td class="mono">${e.value}</td><td>${e.retracted ? '<span class="badge discarded">已撤回</span>' : '<span class="badge applied">有效</span>'}</td></tr>`).join('');
+}
+
+$('#cfg-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  await api('/api/config', 'POST', {
+    windowSizeMs: +f.windowSizeMs.value,
+    allowedLatenessMs: +f.allowedLatenessMs.value,
+    recomputeBoundary: f.recomputeBoundary.value,
+    timezone: f.timezone.value,
+    watermark: { strategy: f.strategy.value, maxOutOfOrdernessMs: +f.maxOutOfOrdernessMs.value },
+  });
+  toast('配置已更新'); refresh();
+});
+$('#ev-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  const t = f.eventTime.value ? new Date(f.eventTime.value).getTime() : Date.now();
+  const r = await api('/api/events', 'POST', {
+    key: f.key.value, value: +f.value.value,
+    eventId: f.eventId.value || `e-${Math.random().toString(36).slice(2, 10)}`,
+    eventTime: t,
+  });
+  toast(JSON.stringify(r.result)); refresh();
+});
+$('#rt-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const r = await api('/api/events', 'POST', { type: 'retract', retractOf: e.target.retractOf.value });
+  toast(JSON.stringify(r.result)); refresh();
+});
+$('#wm-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const r = await api('/api/events', 'POST', { type: 'watermark', value: +e.target.value.value });
+  toast(JSON.stringify(r.result)); refresh();
+});
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+{
+  "name": "event-agg",
+  "version": "1.0.0",
+  "description": "Event-time aggregation service: out-of-order, late, retraction, window reopen",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test"
+  }
+}
